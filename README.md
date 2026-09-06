@@ -4,8 +4,10 @@ AWS Step Functions の検証用リポジトリ。
 
 SQS を起点とした非同期パイプラインで、**並列処理のうち一部だけを早く返せるか**を実機で確認する。
 
+- **[Step Functions 入門と本リポジトリの解説](docs/step-functions-guide.md)** — 予備知識なしで読める解説。ここから
 - [要件定義書](docs/requirements.md)
 - [タスク分解](docs/tasks.md)
+- [検証結果](docs/results.md)
 
 ## 検証するフロー
 
@@ -61,7 +63,7 @@ TRANSFORM_A_SLEEP=1 TRANSFORM_BCD_SLEEP=12 scripts/deploy.sh
 | `infra/template.yaml` | 全リソースの CloudFormation テンプレート（Lambda コードもインライン） |
 | `scripts/common.sh` | スタック出力の取得など共通処理 |
 | `scripts/report.py` | 実行履歴と DynamoDB から受け入れ基準を判定（標準ライブラリのみ） |
-| `docs/` | 要件定義・タスク分解・検証結果 |
+| `docs/` | 解説・要件定義・タスク分解・検証結果 |
 
 ## 作成されるリソース
 
