@@ -456,6 +456,7 @@ Resources:
           STATE_MACHINE_ARN: !Ref StateMachine
       Code:
         ZipFile: |
+          import datetime
           import json
           import os
           import re
@@ -469,6 +470,7 @@ Resources:
           def handler(event, context):
               """Start one execution per SQS message, keyed by messageId."""
               failures = []
+              invoked_at = datetime.datetime.now(datetime.timezone.utc)
 
               for record in event.get("Records", []):
                   message_id = record["messageId"]
@@ -488,14 +490,20 @@ Resources:
                               name=name,
                               input=json.dumps(payload),
                           )
+                          # StartExecution is idempotent for an identical
+                          # name+input: it returns the original execution
+                          # instead of raising. An older startDate means this
+                          # message was already accepted.
+                          replay = started["startDate"] < invoked_at
                           print(json.dumps({
-                              "msg": "execution.started",
+                              "msg": "execution.deduplicated" if replay else "execution.started",
                               "messageId": message_id,
                               "enqueuedAt": enqueued_at,
                               "executionArn": started["executionArn"],
                           }))
                       except sfn.exceptions.ExecutionAlreadyExists:
-                          # Redelivery of a message we already accepted: idempotent no-op.
+                          # Same name but a different input: still a duplicate
+                          # message id, so treat it as an accepted no-op.
                           print(json.dumps({
                               "msg": "execution.duplicate",
                               "messageId": message_id,
