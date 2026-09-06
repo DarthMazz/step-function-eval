@@ -1,0 +1,541 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Step Functions PoC: SQS -> intake Lambda -> Step Functions (preprocess ->
+  4-way Parallel). Each branch writes its own result to DynamoDB as soon as it
+  finishes, so the fast branch is not blocked by the slow ones.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: sfeval
+    Description: Name prefix for every resource in this stack.
+  PreprocessSleepSeconds:
+    Type: Number
+    Default: 1
+    Description: Stub sleep for the preprocess stage.
+  TransformASleepSeconds:
+    Type: Number
+    Default: 1
+    Description: Stub sleep for transform-a (the fast branch, 10s SLA).
+  TransformBcdSleepSeconds:
+    Type: Number
+    Default: 8
+    Description: Stub sleep for transform-b/c/d (the slow branches, 15s SLA).
+  ResultTtlSeconds:
+    Type: Number
+    Default: 86400
+    Description: How long result rows live before DynamoDB TTL removes them.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # Result store
+  # ------------------------------------------------------------------
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Prefix}-results'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: executionId
+          AttributeType: S
+        - AttributeName: taskName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: executionId
+          KeyType: HASH
+        - AttributeName: taskName
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expireAt
+        Enabled: true
+
+  # ------------------------------------------------------------------
+  # Intake queue
+  # ------------------------------------------------------------------
+  IntakeDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Prefix}-intake-dlq'
+      MessageRetentionPeriod: 345600
+
+  IntakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Prefix}-intake'
+      # 6x the intake Lambda timeout, as recommended for SQS event sources.
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IntakeDlq.Arn
+        maxReceiveCount: 3
+
+  # ------------------------------------------------------------------
+  # Generic stub worker: sleeps N seconds and echoes back a fixed result
+  # ------------------------------------------------------------------
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Prefix}-worker'
+      RetentionInDays: 7
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-worker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WorkerLogGroup
+    Properties:
+      FunctionName: !Sub '${Prefix}-worker'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import time
+
+
+          def handler(event, context):
+              """Stub stage. Sleeps for the requested duration, then echoes."""
+              stage = event.get("stage", "unknown")
+              sleep_seconds = float(event.get("sleepSeconds", 0))
+
+              started = time.time()
+              print(json.dumps({"msg": "stage.start", "stage": stage,
+                                "sleepSeconds": sleep_seconds}))
+              time.sleep(sleep_seconds)
+              finished = time.time()
+              print(json.dumps({"msg": "stage.end", "stage": stage,
+                                "elapsedMs": int((finished - started) * 1000)}))
+
+              return {
+                  "stage": stage,
+                  "result": f"{stage}:ok",
+                  "input": event.get("input"),
+                  "startedAt": int(started * 1000),
+                  "finishedAt": int(finished * 1000),
+              }
+
+  # ------------------------------------------------------------------
+  # State machine
+  # ------------------------------------------------------------------
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${Prefix}-workflow'
+      RetentionInDays: 7
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-workflow-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt WorkerFunction.Arn
+                  - !Sub '${WorkerFunction.Arn}:*'
+        - PolicyName: write-results
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ResultsTable.Arn
+        - PolicyName: vended-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Step Functions log delivery requires "*" on these actions.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${Prefix}-workflow'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        WorkerArn: !GetAtt WorkerFunction.Arn
+        ResultsTable: !Ref ResultsTable
+        PreprocessSleep: !Ref PreprocessSleepSeconds
+        TransformASleep: !Ref TransformASleepSeconds
+        TransformBcdSleep: !Ref TransformBcdSleepSeconds
+        TtlSeconds: !Ref ResultTtlSeconds
+      Definition:
+        QueryLanguage: JSONata
+        Comment: >-
+          Preprocess, then fan out to four independent transforms. Every branch
+          persists its own result immediately, so transform-a is readable long
+          before the slow branches finish.
+        TimeoutSeconds: 300
+        StartAt: Preprocess
+        States:
+
+          Preprocess:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: '${WorkerArn}'
+              Payload:
+                stage: preprocess
+                sleepSeconds: '${PreprocessSleep}'
+                input: '{% $states.input.body %}'
+            # Carry the SLA clock into every branch as a variable.
+            Assign:
+              enqueuedAt: '{% $states.input.enqueuedAt %}'
+              messageId: '{% $states.input.messageId %}'
+            Output: '{% { "preprocessed": $states.result.Payload.result } %}'
+            Next: FanOut
+
+          FanOut:
+            Type: Parallel
+            Next: MarkComplete
+            Branches:
+
+              - StartAt: TransformA
+                States:
+                  TransformA:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Arguments:
+                      FunctionName: '${WorkerArn}'
+                      Payload:
+                        stage: transform-a
+                        sleepSeconds: '${TransformASleep}'
+                        input: '{% $states.input.preprocessed %}'
+                    Output: '{% { "result": $states.result.Payload.result } %}'
+                    Next: PutResultA
+                  PutResultA:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
+                    Arguments:
+                      TableName: '${ResultsTable}'
+                      Item:
+                        executionId:
+                          S: '{% $states.context.Execution.Name %}'
+                        taskName:
+                          S: transform-a
+                        enqueuedAt:
+                          N: '{% $string($enqueuedAt) %}'
+                        writtenAt:
+                          N: '{% $string($millis()) %}'
+                        elapsedMs:
+                          N: '{% $string($millis() - $enqueuedAt) %}'
+                        result:
+                          S: '{% $states.input.result %}'
+                        expireAt:
+                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
+                    Output: '{% { "taskName": "transform-a", "elapsedMs": $millis() - $enqueuedAt } %}'
+                    End: true
+
+              - StartAt: TransformB
+                States:
+                  TransformB:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Arguments:
+                      FunctionName: '${WorkerArn}'
+                      Payload:
+                        stage: transform-b
+                        sleepSeconds: '${TransformBcdSleep}'
+                        input: '{% $states.input.preprocessed %}'
+                    Output: '{% { "result": $states.result.Payload.result } %}'
+                    Next: PutResultB
+                  PutResultB:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
+                    Arguments:
+                      TableName: '${ResultsTable}'
+                      Item:
+                        executionId:
+                          S: '{% $states.context.Execution.Name %}'
+                        taskName:
+                          S: transform-b
+                        enqueuedAt:
+                          N: '{% $string($enqueuedAt) %}'
+                        writtenAt:
+                          N: '{% $string($millis()) %}'
+                        elapsedMs:
+                          N: '{% $string($millis() - $enqueuedAt) %}'
+                        result:
+                          S: '{% $states.input.result %}'
+                        expireAt:
+                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
+                    Output: '{% { "taskName": "transform-b", "elapsedMs": $millis() - $enqueuedAt } %}'
+                    End: true
+
+              - StartAt: TransformC
+                States:
+                  TransformC:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Arguments:
+                      FunctionName: '${WorkerArn}'
+                      Payload:
+                        stage: transform-c
+                        sleepSeconds: '${TransformBcdSleep}'
+                        input: '{% $states.input.preprocessed %}'
+                    Output: '{% { "result": $states.result.Payload.result } %}'
+                    Next: PutResultC
+                  PutResultC:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
+                    Arguments:
+                      TableName: '${ResultsTable}'
+                      Item:
+                        executionId:
+                          S: '{% $states.context.Execution.Name %}'
+                        taskName:
+                          S: transform-c
+                        enqueuedAt:
+                          N: '{% $string($enqueuedAt) %}'
+                        writtenAt:
+                          N: '{% $string($millis()) %}'
+                        elapsedMs:
+                          N: '{% $string($millis() - $enqueuedAt) %}'
+                        result:
+                          S: '{% $states.input.result %}'
+                        expireAt:
+                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
+                    Output: '{% { "taskName": "transform-c", "elapsedMs": $millis() - $enqueuedAt } %}'
+                    End: true
+
+              - StartAt: TransformD
+                States:
+                  TransformD:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Arguments:
+                      FunctionName: '${WorkerArn}'
+                      Payload:
+                        stage: transform-d
+                        sleepSeconds: '${TransformBcdSleep}'
+                        input: '{% $states.input.preprocessed %}'
+                    Output: '{% { "result": $states.result.Payload.result } %}'
+                    Next: PutResultD
+                  PutResultD:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
+                    Arguments:
+                      TableName: '${ResultsTable}'
+                      Item:
+                        executionId:
+                          S: '{% $states.context.Execution.Name %}'
+                        taskName:
+                          S: transform-d
+                        enqueuedAt:
+                          N: '{% $string($enqueuedAt) %}'
+                        writtenAt:
+                          N: '{% $string($millis()) %}'
+                        elapsedMs:
+                          N: '{% $string($millis() - $enqueuedAt) %}'
+                        result:
+                          S: '{% $states.input.result %}'
+                        expireAt:
+                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
+                    Output: '{% { "taskName": "transform-d", "elapsedMs": $millis() - $enqueuedAt } %}'
+                    End: true
+
+          MarkComplete:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
+            Arguments:
+              TableName: '${ResultsTable}'
+              Item:
+                executionId:
+                  S: '{% $states.context.Execution.Name %}'
+                taskName:
+                  S: zz-complete
+                enqueuedAt:
+                  N: '{% $string($enqueuedAt) %}'
+                writtenAt:
+                  N: '{% $string($millis()) %}'
+                elapsedMs:
+                  N: '{% $string($millis() - $enqueuedAt) %}'
+                messageId:
+                  S: '{% $messageId %}'
+                expireAt:
+                  N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
+            Output: '{% { "messageId": $messageId, "branches": $states.input } %}'
+            End: true
+
+  # ------------------------------------------------------------------
+  # Intake: SQS -> Lambda -> StartExecution
+  # ------------------------------------------------------------------
+  IntakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Prefix}-intake'
+      RetentionInDays: 7
+
+  IntakeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-intake-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consume-queue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IntakeQueue.Arn
+        - PolicyName: start-workflow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+
+  IntakeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IntakeLogGroup
+    Properties:
+      FunctionName: !Sub '${Prefix}-intake'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IntakeRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachine
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+
+          import boto3
+
+          sfn = boto3.client("stepfunctions")
+          STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
+
+
+          def handler(event, context):
+              """Start one execution per SQS message, keyed by messageId."""
+              failures = []
+
+              for record in event.get("Records", []):
+                  message_id = record["messageId"]
+                  try:
+                      # SentTimestamp is the SLA clock: when the message landed in SQS.
+                      enqueued_at = int(record["attributes"]["SentTimestamp"])
+                      # Execution names allow a limited character set, max 80 chars.
+                      name = re.sub(r"[^0-9a-zA-Z_-]", "-", message_id)[:80]
+                      payload = {
+                          "messageId": message_id,
+                          "enqueuedAt": enqueued_at,
+                          "body": record["body"],
+                      }
+                      try:
+                          started = sfn.start_execution(
+                              stateMachineArn=STATE_MACHINE_ARN,
+                              name=name,
+                              input=json.dumps(payload),
+                          )
+                          print(json.dumps({
+                              "msg": "execution.started",
+                              "messageId": message_id,
+                              "enqueuedAt": enqueued_at,
+                              "executionArn": started["executionArn"],
+                          }))
+                      except sfn.exceptions.ExecutionAlreadyExists:
+                          # Redelivery of a message we already accepted: idempotent no-op.
+                          print(json.dumps({
+                              "msg": "execution.duplicate",
+                              "messageId": message_id,
+                              "name": name,
+                          }))
+                  except Exception as exc:  # noqa: BLE001 - report back to SQS
+                      print(json.dumps({
+                          "msg": "execution.failed",
+                          "messageId": message_id,
+                          "error": repr(exc),
+                      }))
+                      failures.append({"itemIdentifier": message_id})
+
+              return {"batchItemFailures": failures}
+
+  IntakeEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IntakeQueue.Arn
+      FunctionName: !GetAtt IntakeFunction.Arn
+      BatchSize: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+Outputs:
+  QueueUrl:
+    Description: Send test messages here.
+    Value: !Ref IntakeQueue
+  QueueArn:
+    Value: !GetAtt IntakeQueue.Arn
+  DlqUrl:
+    Value: !Ref IntakeDlq
+  ResultsTableName:
+    Value: !Ref ResultsTable
+  StateMachineArn:
+    Value: !Ref StateMachine
+  StateMachineLogGroup:
+    Value: !Ref StateMachineLogGroup
+  IntakeFunctionName:
+    Value: !Ref IntakeFunction
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
