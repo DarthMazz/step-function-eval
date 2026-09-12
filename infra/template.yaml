@@ -25,6 +25,15 @@ Parameters:
     Type: Number
     Default: 86400
     Description: How long result rows live before DynamoDB TTL removes them.
+  StateMachineType:
+    Type: String
+    Default: STANDARD
+    AllowedValues: [STANDARD, EXPRESS]
+    Description: >-
+      Workflow type. STANDARD keeps a service-side execution history and
+      deduplicates executions by name; EXPRESS keeps neither and is observable
+      only through CloudWatch Logs. Deploy a second stack with a different
+      Prefix to compare the two side by side.
 
 Resources:
 
@@ -91,6 +100,16 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        # The worker persists its own result row, so the write permission lives
+        # here rather than on the state machine role.
+        - PolicyName: write-results
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ResultsTable.Arn
 
   WorkerFunction:
     Type: AWS::Lambda::Function
@@ -102,32 +121,82 @@ Resources:
       Role: !GetAtt WorkerRole.Arn
       Timeout: 60
       MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ResultsTable
+          RESULT_TTL_SECONDS: !Ref ResultTtlSeconds
       Code:
         ZipFile: |
           import json
+          import os
           import time
+
+          import boto3
+
+          RESULTS_TABLE = os.environ["RESULTS_TABLE"]
+          TTL_SECONDS = int(os.environ["RESULT_TTL_SECONDS"])
+
+          # Module scope: the client is reused across warm invocations.
+          dynamodb = boto3.client("dynamodb")
 
 
           def handler(event, context):
-              """Stub stage. Sleeps for the requested duration, then echoes."""
+              """Stub stage. Sleeps, writes its own result row, then echoes.
+
+              The state machine only says *that* a stage runs; the result row's
+              shape and timing are decided here. `emit` carries the row's
+              identity -- when it is absent the stage writes nothing.
+              """
               stage = event.get("stage", "unknown")
               sleep_seconds = float(event.get("sleepSeconds", 0))
+              emit = event.get("emit")
 
               started = time.time()
               print(json.dumps({"msg": "stage.start", "stage": stage,
                                 "sleepSeconds": sleep_seconds}))
               time.sleep(sleep_seconds)
+
+              result = f"{stage}:ok"
+              written_at = put_result(stage, result, emit) if emit else None
+
               finished = time.time()
               print(json.dumps({"msg": "stage.end", "stage": stage,
-                                "elapsedMs": int((finished - started) * 1000)}))
+                                "elapsedMs": int((finished - started) * 1000),
+                                "writtenAt": written_at}))
 
               return {
                   "stage": stage,
-                  "result": f"{stage}:ok",
+                  "result": result,
                   "input": event.get("input"),
                   "startedAt": int(started * 1000),
                   "finishedAt": int(finished * 1000),
+                  "writtenAt": written_at,
               }
+
+
+          def put_result(stage, result, emit):
+              """Persist this stage's result. Returns the write time in epoch ms.
+
+              Stamped just before the PutItem call, matching what the previous
+              SDK-integration state recorded, so the numbers stay comparable.
+              """
+              enqueued_at = int(emit["enqueuedAt"])
+              written_at = int(time.time() * 1000)
+
+              item = {
+                  "executionId": {"S": emit["executionId"]},
+                  "taskName": {"S": stage},
+                  "enqueuedAt": {"N": str(enqueued_at)},
+                  "writtenAt": {"N": str(written_at)},
+                  "elapsedMs": {"N": str(written_at - enqueued_at)},
+                  "result": {"S": result},
+                  "expireAt": {"N": str(written_at // 1000 + TTL_SECONDS)},
+              }
+              if emit.get("messageId"):
+                  item["messageId"] = {"S": emit["messageId"]}
+
+              dynamodb.put_item(TableName=RESULTS_TABLE, Item=item)
+              return written_at
 
   # ------------------------------------------------------------------
   # State machine
@@ -159,13 +228,6 @@ Resources:
                 Resource:
                   - !GetAtt WorkerFunction.Arn
                   - !Sub '${WorkerFunction.Arn}:*'
-        - PolicyName: write-results
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: dynamodb:PutItem
-                Resource: !GetAtt ResultsTable.Arn
         - PolicyName: vended-logs
           PolicyDocument:
             Version: '2012-10-17'
@@ -187,7 +249,7 @@ Resources:
     Type: AWS::StepFunctions::StateMachine
     Properties:
       StateMachineName: !Sub '${Prefix}-workflow'
-      StateMachineType: STANDARD
+      StateMachineType: !Ref StateMachineType
       RoleArn: !GetAtt StateMachineRole.Arn
       LoggingConfiguration:
         Level: ALL
@@ -197,17 +259,16 @@ Resources:
               LogGroupArn: !GetAtt StateMachineLogGroup.Arn
       DefinitionSubstitutions:
         WorkerArn: !GetAtt WorkerFunction.Arn
-        ResultsTable: !Ref ResultsTable
         PreprocessSleep: !Ref PreprocessSleepSeconds
         TransformASleep: !Ref TransformASleepSeconds
         TransformBcdSleep: !Ref TransformBcdSleepSeconds
-        TtlSeconds: !Ref ResultTtlSeconds
       Definition:
         QueryLanguage: JSONata
         Comment: >-
-          Preprocess, then fan out to four independent transforms. Every branch
-          persists its own result immediately, so transform-a is readable long
-          before the slow branches finish.
+          Preprocess, then fan out to four independent transforms. This
+          definition describes the flow only: each stage's worker writes its own
+          result row to DynamoDB before it returns, so transform-a is readable
+          long before the slow branches finish.
         TimeoutSeconds: 300
         StartAt: Preprocess
         States:
@@ -221,6 +282,7 @@ Resources:
                 stage: preprocess
                 sleepSeconds: '${PreprocessSleep}'
                 input: '{% $states.input.body %}'
+            # No "emit" -- the preprocess stage writes nothing.
             # Carry the SLA clock into every branch as a variable.
             Assign:
               enqueuedAt: '{% $states.input.enqueuedAt %}'
@@ -244,29 +306,13 @@ Resources:
                         stage: transform-a
                         sleepSeconds: '${TransformASleep}'
                         input: '{% $states.input.preprocessed %}'
-                    Output: '{% { "result": $states.result.Payload.result } %}'
-                    Next: PutResultA
-                  PutResultA:
-                    Type: Task
-                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
-                    Arguments:
-                      TableName: '${ResultsTable}'
-                      Item:
-                        executionId:
-                          S: '{% $states.context.Execution.Name %}'
-                        taskName:
-                          S: transform-a
-                        enqueuedAt:
-                          N: '{% $string($enqueuedAt) %}'
-                        writtenAt:
-                          N: '{% $string($millis()) %}'
-                        elapsedMs:
-                          N: '{% $string($millis() - $enqueuedAt) %}'
-                        result:
-                          S: '{% $states.input.result %}'
-                        expireAt:
-                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
-                    Output: '{% { "taskName": "transform-a", "elapsedMs": $millis() - $enqueuedAt } %}'
+                        # "emit" tells the worker to persist its result and
+                        # identifies the row. The row's shape lives in the
+                        # worker, not here.
+                        emit:
+                          executionId: '{% $states.context.Execution.Name %}'
+                          enqueuedAt: '{% $enqueuedAt %}'
+                    Output: '{% { "taskName": "transform-a", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
               - StartAt: TransformB
@@ -280,29 +326,10 @@ Resources:
                         stage: transform-b
                         sleepSeconds: '${TransformBcdSleep}'
                         input: '{% $states.input.preprocessed %}'
-                    Output: '{% { "result": $states.result.Payload.result } %}'
-                    Next: PutResultB
-                  PutResultB:
-                    Type: Task
-                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
-                    Arguments:
-                      TableName: '${ResultsTable}'
-                      Item:
-                        executionId:
-                          S: '{% $states.context.Execution.Name %}'
-                        taskName:
-                          S: transform-b
-                        enqueuedAt:
-                          N: '{% $string($enqueuedAt) %}'
-                        writtenAt:
-                          N: '{% $string($millis()) %}'
-                        elapsedMs:
-                          N: '{% $string($millis() - $enqueuedAt) %}'
-                        result:
-                          S: '{% $states.input.result %}'
-                        expireAt:
-                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
-                    Output: '{% { "taskName": "transform-b", "elapsedMs": $millis() - $enqueuedAt } %}'
+                        emit:
+                          executionId: '{% $states.context.Execution.Name %}'
+                          enqueuedAt: '{% $enqueuedAt %}'
+                    Output: '{% { "taskName": "transform-b", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
               - StartAt: TransformC
@@ -316,29 +343,10 @@ Resources:
                         stage: transform-c
                         sleepSeconds: '${TransformBcdSleep}'
                         input: '{% $states.input.preprocessed %}'
-                    Output: '{% { "result": $states.result.Payload.result } %}'
-                    Next: PutResultC
-                  PutResultC:
-                    Type: Task
-                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
-                    Arguments:
-                      TableName: '${ResultsTable}'
-                      Item:
-                        executionId:
-                          S: '{% $states.context.Execution.Name %}'
-                        taskName:
-                          S: transform-c
-                        enqueuedAt:
-                          N: '{% $string($enqueuedAt) %}'
-                        writtenAt:
-                          N: '{% $string($millis()) %}'
-                        elapsedMs:
-                          N: '{% $string($millis() - $enqueuedAt) %}'
-                        result:
-                          S: '{% $states.input.result %}'
-                        expireAt:
-                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
-                    Output: '{% { "taskName": "transform-c", "elapsedMs": $millis() - $enqueuedAt } %}'
+                        emit:
+                          executionId: '{% $states.context.Execution.Name %}'
+                          enqueuedAt: '{% $enqueuedAt %}'
+                    Output: '{% { "taskName": "transform-c", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
               - StartAt: TransformD
@@ -352,51 +360,24 @@ Resources:
                         stage: transform-d
                         sleepSeconds: '${TransformBcdSleep}'
                         input: '{% $states.input.preprocessed %}'
-                    Output: '{% { "result": $states.result.Payload.result } %}'
-                    Next: PutResultD
-                  PutResultD:
-                    Type: Task
-                    Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
-                    Arguments:
-                      TableName: '${ResultsTable}'
-                      Item:
-                        executionId:
-                          S: '{% $states.context.Execution.Name %}'
-                        taskName:
-                          S: transform-d
-                        enqueuedAt:
-                          N: '{% $string($enqueuedAt) %}'
-                        writtenAt:
-                          N: '{% $string($millis()) %}'
-                        elapsedMs:
-                          N: '{% $string($millis() - $enqueuedAt) %}'
-                        result:
-                          S: '{% $states.input.result %}'
-                        expireAt:
-                          N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
-                    Output: '{% { "taskName": "transform-d", "elapsedMs": $millis() - $enqueuedAt } %}'
+                        emit:
+                          executionId: '{% $states.context.Execution.Name %}'
+                          enqueuedAt: '{% $enqueuedAt %}'
+                    Output: '{% { "taskName": "transform-d", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
           MarkComplete:
             Type: Task
-            Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
+            Resource: arn:aws:states:::lambda:invoke
             Arguments:
-              TableName: '${ResultsTable}'
-              Item:
-                executionId:
-                  S: '{% $states.context.Execution.Name %}'
-                taskName:
-                  S: zz-complete
-                enqueuedAt:
-                  N: '{% $string($enqueuedAt) %}'
-                writtenAt:
-                  N: '{% $string($millis()) %}'
-                elapsedMs:
-                  N: '{% $string($millis() - $enqueuedAt) %}'
-                messageId:
-                  S: '{% $messageId %}'
-                expireAt:
-                  N: '{% $string($floor($millis() / 1000) + ${TtlSeconds}) %}'
+              FunctionName: '${WorkerArn}'
+              Payload:
+                stage: zz-complete
+                sleepSeconds: 0
+                emit:
+                  executionId: '{% $states.context.Execution.Name %}'
+                  enqueuedAt: '{% $enqueuedAt %}'
+                  messageId: '{% $messageId %}'
             Output: '{% { "messageId": $messageId, "branches": $states.input } %}'
             End: true
 

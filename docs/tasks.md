@@ -27,17 +27,20 @@
 
 ### T1-2. 汎用スタブ Lambda `sfeval-worker`
 - `Code.ZipFile` に Python 3.12 でインライン実装
-- 入力 `{stage, sleepSeconds, input}` を受け、指定秒スリープして `{stage, result, startedAt, finishedAt}` を返す
-- 実行ロールは `AWSLambdaBasicExecutionRole` 相当のみ
+- 入力 `{stage, sleepSeconds, input, emit?}` を受け、指定秒スリープして
+  `{stage, result, startedAt, finishedAt, writtenAt}` を返す
+- `emit` があれば DynamoDB に結果行を書く（書き込み項目は `emit` の `executionId` / `enqueuedAt` と
+  環境変数 `RESULTS_TABLE` / `RESULT_TTL_SECONDS` から組み立てる）
+- 実行ロールは `AWSLambdaBasicExecutionRole` 相当 + 対象テーブルへの `dynamodb:PutItem`
 - 完了条件: デプロイ後 `aws lambda invoke` で単体動作する
 
 ### T1-3. ステートマシン `sfeval-workflow`
 - `QueryLanguage: JSONata` / Type `STANDARD`
 - 構成: `Preprocess` → `FanOut`(Parallel × 4) → `MarkComplete`
-- 各分岐: `Transform{A|B|C|D}`（worker 呼び出し）→ `PutResult{A|B|C|D}`（`aws-sdk:dynamodb:putItem`）
-- 書き込み項目: `executionId` / `taskName` / `enqueuedAt` / `writtenAt`(`$millis()`) / `elapsedMs` / `expireAt`
+- 各分岐は `Transform{A|B|C|D}` の1ステートのみ。結果の書き込みは worker の中で起きる
+- 定義が持つのは**フローの順序だけ**。書き込み項目の仕様は持たない（T1-2 が持つ）
 - ログ設定 `ALL` + `includeExecutionData: true`
-- IAM ロール: `lambda:InvokeFunction`（worker のみ）/ `dynamodb:PutItem`（対象テーブルのみ）/ ログ配信権限
+- IAM ロール: `lambda:InvokeFunction`（worker のみ）/ ログ配信権限。**DynamoDB 権限は持たない**
 - 完了条件: 手動 `start-execution` で最後まで通り `SUCCEEDED` になる
 
 ### T1-4. 受付 Lambda `sfeval-intake` と SQS 連携
@@ -64,7 +67,7 @@
 - 直近の実行を `ListExecutions` で特定
 - `DescribeExecution` でステータスと所要時間を取得
 - `GetExecutionHistory` から各ステートの `EnteredTime` / `ExitedTime` を抽出
-- DynamoDB を `Query` して `elapsedMs` を一覧表示
+- DynamoDB を `Query` して `elapsedMs` を一覧表示（AC-6 は `TransformA` の退出時刻で判定）
 - 受け入れ基準 AC-1〜AC-8 を判定し PASS/FAIL を出力
 
 ### T2-4. `scripts/teardown.sh`
@@ -95,8 +98,34 @@
 
 ## Phase 4: 追加要望の受け入れ
 
-Phase 3 完了後、未提示の制限事項をヒアリングして追加検証項目を定義する。
-現時点で候補として認識しているもの:
+### T4-1. 結果書き込みを Lambda 側へ移設（2026-09-12）
+
+「テンプレートは動作ロジックのみを定義し、結果出力は Lambda 上で制御する」方針への変更。
+
+- `PutResult{A|B|C|D}` / `MarkComplete` の `aws-sdk:dynamodb:putItem` ステートを削除
+- worker Lambda が `emit` を受けたときに自分で結果行を書く
+- `dynamodb:PutItem` をステートマシンロールから worker ロールへ移動
+- `report.py` の AC-6 判定を `PutResultA` → `TransformA` の退出時刻に変更
+- 完了条件: **すべて達成（2026-09-12）**
+  1. ✅ `deploy.sh` でスタック作成完了
+  2. ✅ デプロイ済み定義が7ステート（旧11）、`Resource` は全て `lambda:invoke`
+  3. ✅ ウォーム5回 + コールド1回で AC-1〜AC-8 が PASS
+  4. ✅ 再計測値を `docs/results.md` に記録（ウォームは改善、コールドは悪化）
+
+### T4-2. STANDARD と EXPRESS のコンソール比較（2026-09-12）
+
+障害解析のしやすさを実機で確認する。
+
+- `StateMachineType` をテンプレートのパラメータ化（`Prefix` は既に外出し済み）
+- `deploy.sh` が `PREFIX` / `SFN_TYPE` を受けるようにする
+- EXPRESS スタック `sfeval-express-poc`（`Prefix=sfeval-exp`）を並べて作成
+- 両方に同一原因の失敗実行を作り、コンソールの表示を比較
+- 完了条件: **すべて達成**
+  1. ✅ 両スタック稼働（型を `describe-state-machine` で確認）
+  2. ✅ 一覧・失敗詳細・グラフビューを比較
+  3. ✅ 結果を `docs/console-comparison.md` に記録
+
+### 今後の候補
 
 - 分岐単位の `Catch` による失敗の封じ込め（Parallel の巻き添えキャンセル対策）
 - Retry / タイムアウト / Redrive の挙動確認

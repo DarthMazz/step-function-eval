@@ -40,7 +40,7 @@ SQS を起点とした非同期処理パイプラインを AWS Step Functions �
 ## 3. スコープ
 
 ### 対象
-- ①②③④ の各処理の**スタブ実装**（指定秒数スリープして固定値を返すだけ）
+- ①②③④ の各処理の**スタブ実装**（指定秒数スリープし、結果行を書いて固定値を返すだけ）
 - SQS → Lambda → Step Functions の起動連携
 - Parallel による4並列実行
 - 各ブランチからの個別結果書き出し（DynamoDB）
@@ -62,7 +62,7 @@ SQS を起点とした非同期処理パイプラインを AWS Step Functions �
 | FR-4 | 同一メッセージが再配信された場合、実行が二重に開始されない（`messageId` を実行名に用いた冪等化） |
 | FR-5 | ステートマシンは ② 前処理を実行し、その出力を ③ の4分岐すべてに同一入力として渡す |
 | FR-6 | ③ は Parallel ステートで4つの加工を**同時に**開始する |
-| FR-7 | 各分岐は、自分の加工が終わった時点で**他の分岐の完了を待たずに** DynamoDB へ結果を書き込む |
+| FR-7 | 各分岐は、自分の加工が終わった時点で**他の分岐の完了を待たずに** DynamoDB へ結果を書き込む（書き込みは加工 Lambda の中で行う） |
 | FR-8 | 各書き込みレコードには、SQS 到着時刻・書き込み時刻・経過ミリ秒を含める |
 | FR-9 | 4分岐すべての完了後、④ で全体完了レコードを DynamoDB に書き込み、実行を正常終了する |
 | FR-10 | 各処理のスリープ秒数は環境変数／テンプレートパラメータで変更できる |
@@ -86,8 +86,9 @@ Step Functions の **Parallel ステートは全ブランチの完了を待っ�
 ステートマシンの出力経路に結果を載せると、加工A の結果も最も遅い分岐（B/C/D）に引きずられ、
 NFR-1（10秒以内）は原理的に達成できない。
 
-したがって、**各分岐の末尾に DynamoDB への書き込みステートを置き、副作用として結果を外部に出す**。
+したがって、**各分岐が自分の加工を終えた時点で DynamoDB に書き込み、副作用として結果を外部に出す**。
 Parallel の完了は「全部終わった」ことを示すだけの意味になる。
+（書き込みをどこで行うかは 6.4 を参照。）
 
 ### 6.2 なぜ Map ではなく Parallel か
 
@@ -101,18 +102,39 @@ Parallel の完了は「全部終わった」ことを示すだけの意味に�
 - 想定実行時間は最大15秒程度で、Standard のオーバーヘッド（数百ms）は許容範囲
 - Express は履歴が CloudWatch Logs 依存になり、時刻の突き合わせが煩雑
 
-### 6.4 DynamoDB 書き込みは Lambda ではなく SDK 統合
+### 6.4 DynamoDB 書き込みは加工 Lambda の中で行う
 
-書き込みを Step Functions の AWS SDK 統合（`aws-sdk:dynamodb:putItem`）で行う。
+各ステージの worker Lambda が、返る前に自分の結果行を書く。
+ステートマシン定義には「どの順序で何が動くか」だけを残し、**結果の出力仕様は持たせない**。
 
-- Lambda を1つ減らせる
-- **書き込み完了時刻が実行履歴にステートとして残る**ため、到達時刻の実測がそのまま取れる
-- 加工 Lambda を差し替えても書き込み仕様が変わらない
+- テンプレートが**フローの定義だけ**になり、出力仕様の変更で IaC を触らずに済む
+- 書き込み権限が、実際に書き込む主体（worker ロール）に付く
+- 分岐あたりのステート数が2→1に減る
+
+ステートマシンから worker へは `emit`（`executionId` / `enqueuedAt`）だけを渡す。
+これが無いステージ（前処理）は何も書かない。
+
+> **2026-09-12 に変更。** 当初は Step Functions の AWS SDK 統合
+> （`aws-sdk:dynamodb:putItem`）を専用ステートとして置き、`elapsedMs` を JSONata の算術で出していた。
+> 「テンプレートは動作ロジックのみ、結果出力はアプリ側」という方針に合わせて移した。
+>
+> 失ったもの: **書き込み完了時刻が実行履歴の独立したステートとして残らなくなった。**
+> コンソールのグラフビューでは分岐あたりの箱が2つから1つになり、書き込みの所要時間は
+> グラフから読めない。行の `writtenAt` と worker の CloudWatch Logs で代替する。
+> AC-6 の判定も `PutResultA` の退出時刻から `TransformA` の退出時刻に変わった
+> （書き込みが Task に内包されたため、判定の意味は保たれる）。
+>
+> 実測での影響（[results.md](./results.md)）: ウォーム時は**速くなった**
+> （加工A 到達 2375ms → 2306ms。SDK 統合ステート 90〜160ms が Lambda 内 `put_item` 5〜8ms になったため）。
+> 一方で**コールドスタートは悪化した**（加工A の増分 +1145ms → +2002ms）。
+> worker が `boto3` のインポートとクライアント生成をモジュールスコープで行うようになったため。
+> 目標に対する余裕は残るが、実処理を載せる際は見込むこと。
 
 ### 6.5 クエリ言語は JSONata
 
-経過ミリ秒の算出（`$millis() - enqueuedAt`）に算術が必要で、JSONPath の組み込み関数では実現できない。
-JSONata（`QueryLanguage: JSONata`）を採用する。入出力処理の検証という当初目的にも合致する。
+当初は経過ミリ秒の算出（`$millis() - enqueuedAt`）に算術が必要で、JSONPath では実現できなかった。
+6.4 の変更でその算術は Lambda 側に移ったが、JSONata（`QueryLanguage: JSONata`）は維持する。
+分岐の `Output` での算術や `Assign` した変数の参照が素直に書け、入出力処理の検証という当初目的にも合致するため。
 
 ### 6.6 Lambda コードはテンプレートにインライン記述
 
@@ -122,7 +144,8 @@ S3 アーティファクトバケットもビルド手順も不要になり、`a
 ### 6.7 加工A〜D は単一の汎用スタブ Lambda を共用
 
 4分岐は ASL 上は独立した Task ステートだが、呼び出す Lambda は共通の汎用スタブ1つとし、
-`stage` と `sleepSeconds` をペイロードで渡し分ける。フロー検証には十分で、後から個別関数へ分割するのも容易。
+`stage` / `sleepSeconds` / `emit` をペイロードで渡し分ける。フロー検証には十分で、後から個別関数へ分割するのも容易。
+結果の書き込み（6.4）もこの共通 worker が担う。
 
 ## 7. リソース一覧
 
@@ -133,7 +156,7 @@ S3 アーティファクトバケットもビルド手順も不要になり、`a
 | SQS | `sfeval-intake` | 標準キュー。`VisibilityTimeout` は受付 Lambda タイムアウトの6倍 |
 | SQS | `sfeval-intake-dlq` | `maxReceiveCount: 3` |
 | Lambda | `sfeval-intake` | SQS イベントソースマッピング（`BatchSize: 1`）→ `StartExecution` |
-| Lambda | `sfeval-worker` | 汎用スタブ。`sleepSeconds` 秒スリープして固定値を返す |
+| Lambda | `sfeval-worker` | 汎用スタブ。`sleepSeconds` 秒スリープし、`emit` があれば結果行を書いて返す |
 | Step Functions | `sfeval-workflow` | Standard / JSONata / ログ ALL + 実行データ含む |
 | DynamoDB | `sfeval-results` | PK `executionId` (S) / SK `taskName` (S) / オンデマンド / TTL `expireAt` |
 | CloudWatch Logs | `/aws/vendedlogs/states/sfeval-workflow` | 保持期間 7日 |
@@ -158,7 +181,7 @@ S3 アーティファクトバケットもビルド手順も不要になり、`a
 | AC-3 | ③ の4分岐がほぼ同時に開始されている | 各分岐先頭ステートの `EnteredTime` の差が1秒未満 |
 | AC-4 | **加工A の結果が SQS 到着から10秒以内に DynamoDB にある** | レコードの `elapsedMs < 10000` |
 | AC-5 | **加工B/C/D の結果が SQS 到着から15秒以内にある** | レコードの `elapsedMs < 15000` |
-| AC-6 | **加工A の書き込みが Parallel 完了より前に起きている** | A の `writtenAt` < Parallel 終了時刻 |
+| AC-6 | **加工A の書き込みが Parallel 完了より前に起きている** | `TransformA` の退出時刻 < Parallel 終了時刻（参考として行の `writtenAt` も併記） |
 | AC-7 | 実行が `SUCCEEDED` で終わり、DynamoDB に5レコード（加工4＋完了1）ある | `DescribeExecution` + `Query` |
 | AC-8 | 同一 `messageId` を再投入しても実行が増えない | `ListExecutions` |
 

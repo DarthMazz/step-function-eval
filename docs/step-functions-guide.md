@@ -74,7 +74,8 @@ Resource: arn:aws:states:::aws-sdk:dynamodb:putItem
 「DynamoDB に1行書く」「SNS に通知する」「S3 に置く」といった **AWS を呼ぶだけの処理に、Lambda を1つも書かなくていい**。
 200以上のサービスに対応している。
 
-本リポジトリの結果書き込みは全部これ。Lambda を書いていたら、関数のデプロイ・IAM・ログ・コールドスタートが全部ついてきていた。
+本リポジトリも当初は結果書き込みを全部これでやっていた。今は Lambda 側に移してあるが、
+理由は速度でも機能でもなく**責務の置き場所**の話。詳しくは後述の「なぜ SDK 統合をやめたか」。
 
 ## 入出力 — バケツリレー
 
@@ -119,7 +120,7 @@ Standard を選んだ決め手は **実行履歴が API で取れる**こと。
 ## ファイル構成
 
 ```
-infra/template.yaml   549行  全リソース定義（Lambda のコードもここに入っている）
+infra/template.yaml   521行  全リソース定義（Lambda のコードもここに入っている）
 scripts/
   common.sh            25行  スタック出力の取得など共通処理
   deploy.sh            28行  デプロイ
@@ -127,7 +128,7 @@ scripts/
   verify.sh            42行  実行データを集めて report.py に渡す
   test-idempotency.sh  51行  冪等化テスト
   teardown.sh          12行  削除
-  report.py           179行  受け入れ基準の判定
+  report.py           184行  受け入れ基準の判定
 docs/                        要件定義・タスク分解・結果・本ガイド
 ```
 
@@ -138,8 +139,8 @@ CloudFormation テンプレートは3ブロック。
 | ブロック | 行 | 内容 |
 |---|---|---|
 | `Parameters` | [7-27](../infra/template.yaml#L7) | デプロイ時に変えられる値（スリープ秒数など） |
-| `Resources` | [29-530](../infra/template.yaml#L29) | 作るもの13個 |
-| `Outputs` | [532-549](../infra/template.yaml#L532) | 作った後に知りたい値（キューURL、テーブル名など） |
+| `Resources` | [29-502](../infra/template.yaml#L29) | 作るもの13個 |
+| `Outputs` | [504-521](../infra/template.yaml#L504) | 作った後に知りたい値（キューURL、テーブル名など） |
 
 `Resources` の13個は、役割で4グループに分かれる。
 
@@ -155,7 +156,7 @@ AWS では「誰が何をしてよいか」を必ず IAM ロールで宣言す�
 
 ## ステートマシン定義を1行ずつ読む
 
-[template.yaml:215-230](../infra/template.yaml#L215) の前処理ステート。
+[template.yaml:267-282](../infra/template.yaml#L267) の前処理ステート。
 
 ```yaml
 Preprocess:
@@ -181,7 +182,7 @@ Preprocess:
 | `${WorkerArn}` | **CloudFormation** | デプロイ時に1回だけ置換 |
 | `{% $states.input.body %}` | **Step Functions** | 実行のたびに毎回評価 |
 
-前者は `DefinitionSubstitutions`（[template.yaml:198-204](../infra/template.yaml#L198)）で値を渡している。
+前者は `DefinitionSubstitutions`（[template.yaml:251-256](../infra/template.yaml#L251)）で値を渡している。
 Lambda の ARN はデプロイするまで確定しないので、この仕組みが必要。
 
 `$states` は Step Functions の予約変数。
@@ -194,7 +195,7 @@ Lambda の ARN はデプロイするまで確定しないので、この仕組�
 
 ## Parallel の書き方
 
-[template.yaml:231-235](../infra/template.yaml#L231)
+[template.yaml:284-288](../infra/template.yaml#L284)
 
 ```yaml
 FanOut:
@@ -213,37 +214,86 @@ FanOut:
 4分岐すべてに **Parallel への入力がそのままコピーされて**渡る。
 「同じデータを4通りに加工する」という要件にそのまま合致する。
 
-## SDK 統合の実際 — 結果の書き込み
+## 結果の書き込み — ステートマシンではなく Lambda で
 
-[template.yaml:249-271](../infra/template.yaml#L249)
+[template.yaml:291-305](../infra/template.yaml#L291) の加工A。**ステートは1つだけ**で、
+「worker を呼ぶ」以上のことは書いていない。
 
 ```yaml
-PutResultA:
+TransformA:
   Type: Task
-  Resource: arn:aws:states:::aws-sdk:dynamodb:putItem   # Lambda ではない
+  Resource: arn:aws:states:::lambda:invoke
   Arguments:
-    TableName: '${ResultsTable}'
-    Item:
-      executionId:
-        S: '{% $states.context.Execution.Name %}'
-      taskName:
-        S: transform-a
-      enqueuedAt:
-        N: '{% $string($enqueuedAt) %}'
-      writtenAt:
-        N: '{% $string($millis()) %}'
-      elapsedMs:
-        N: '{% $string($millis() - $enqueuedAt) %}'      # ← JSONata の算術
+    FunctionName: '${WorkerArn}'
+    Payload:
+      stage: transform-a
+      sleepSeconds: '${TransformASleep}'
+      input: '{% $states.input.preprocessed %}'
+      emit:                                              # ← 「結果を残せ」の指示
+        executionId: '{% $states.context.Execution.Name %}'
+        enqueuedAt: '{% $enqueuedAt %}'
+  Output: '{% { "taskName": "transform-a", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
   End: true
 ```
 
-見慣れない `S:` `N:` は **DynamoDB の型付き表記**。`S` = 文字列、`N` = 数値。
-DynamoDB の低レベル API はこの形式を要求するため、SDK 統合でもそのまま書く
-（数値も文字列で囲むのが仕様なので `$string()` で変換している）。
+`emit` は**行の中身ではなく、行の身元だけ**を渡す。どのテーブルに、どんな属性で、
+どの時刻を刻んで書くかは worker 側 ([template.yaml:157-183](../infra/template.yaml#L157)) が決める。
 
-`$enqueuedAt` が、前処理ステートで `Assign` した変数。Parallel の分岐の中からでも参照できている。
+```python
+def put_result(stage, result, emit):
+    enqueued_at = int(emit["enqueuedAt"])
+    written_at = int(time.time() * 1000)
 
-**この1ステートが設計の核心。** ここで書き込むから、加工A は他の分岐を待たずに結果を外に出せる。
+    item = {
+        "executionId": {"S": emit["executionId"]},
+        "taskName": {"S": stage},
+        "enqueuedAt": {"N": str(enqueued_at)},
+        "writtenAt": {"N": str(written_at)},
+        "elapsedMs": {"N": str(written_at - enqueued_at)},   # ← ただの引き算
+        "result": {"S": result},
+        "expireAt": {"N": str(written_at // 1000 + TTL_SECONDS)},
+    }
+    dynamodb.put_item(TableName=RESULTS_TABLE, Item=item)
+    return written_at
+```
+
+`S:` `N:` は **DynamoDB の型付き表記**。`S` = 文字列、`N` = 数値。
+低レベル API がこの形式を要求するため、Python から呼ぶときも同じ形で書く。
+
+`emit` を渡さなければ書き込みは起きない。前処理ステートには `emit` が無いので、
+同じ worker を使いながら何も残さない。
+
+**この書き込みが設計の核心。** ここで書くから、加工A は他の分岐を待たずに結果を外に出せる。
+
+### なぜ SDK 統合をやめたか
+
+以前はこの書き込みを Step Functions の **AWS SDK 統合**（`arn:aws:states:::aws-sdk:dynamodb:putItem`）
+という別ステートで行っていた。Lambda を経由せず Step Functions が直接 AWS API を叩ける機能で、
+`elapsedMs` は JSONata の算術（`$millis() - $enqueuedAt`）で出していた。
+
+やめた理由は**責務の置き場所**。テンプレートは「どういう順序で何が動くか」だけを持ち、
+「結果をどう残すか」はアプリケーション側（Lambda）に置きたい。
+出力仕様を変えるたびに IaC を触るのは、変更の単位として大きすぎる。
+
+トレードオフも書いておく。
+
+| | SDK 統合（旧） | Lambda 内で書く（新） |
+|---|---|---|
+| 書き込み完了時刻 | **実行履歴に専用ステートとして残る** | Lambda の中。行の `writtenAt` で見る |
+| 出力仕様の変更 | テンプレート修正＋再デプロイ | Lambda コードのみ |
+| DynamoDB 権限 | ステートマシンロール | worker ロール |
+| ステート数 | 分岐あたり2 | 分岐あたり1 |
+| 失敗の切り分け | 「加工が失敗」と「書き込みが失敗」が別ステート | 同じ Task に混ざる |
+| 書き込み1回のコスト | 約 90〜160ms（ステート遷移込み） | **5〜8ms**（`put_item` 単体） |
+| コールドスタート | — | **+約800ms 悪化**（boto3 の初期化） |
+
+実測は [検証結果](./results.md) にある。**ウォーム時は新構成が速く、コールド時は旧構成が速い。**
+常時トラフィックがあるなら新構成が有利で、散発的な起動が多いならコールドスタート対策が要る。
+
+コンソールのグラフビューは、旧構成では分岐ごとに箱が2つ並んでいた。
+新構成では1つになり、**書き込みの所要時間はグラフからは読めなくなる**。
+代わりに worker の CloudWatch Logs（`stage.end` 行の `writtenAt`）と
+DynamoDB の行そのものを見ることになる。
 
 ## なぜこの設計だったか
 
@@ -255,7 +305,7 @@ DynamoDB の低レベル API はこの形式を要求するため、SDK 統合�
     → 10秒目標に対して余裕がほぼゼロ
 
 【採用した設計】
-  各分岐の末尾で、自分の結果を DynamoDB に書く
+  各分岐の加工 Lambda が、返る前に自分の結果を DynamoDB に書く
     → 加工A は自分が終わった 2.4秒後に書き込み完了
     → 実測で Parallel 完了より 7.1秒早い
 ```
@@ -265,7 +315,7 @@ Step Functions の出力経路は使わず、**副作用として外に出す**�
 
 ## Lambda のコードがテンプレートに埋まっている理由
 
-[template.yaml:106-133](../infra/template.yaml#L106) を見ると、Python のコードが YAML の中に直接書かれている。
+[template.yaml:105-183](../infra/template.yaml#L105) を見ると、Python のコードが YAML の中に直接書かれている。
 
 ```yaml
 Code:
@@ -289,19 +339,28 @@ Code:
 ## IAM の考え方
 
 3つのロールがあるが、いずれも**必要最小限だけを許可**している。
-たとえばステートマシンのロール（[template.yaml:141-185](../infra/template.yaml#L141)）:
+たとえばステートマシンのロール（[template.yaml:201-237](../infra/template.yaml#L201)）は、
+**Lambda を呼ぶ権限しか持っていない**。
 
 ```yaml
 - Effect: Allow
   Action: lambda:InvokeFunction
   Resource:
     - !GetAtt WorkerFunction.Arn      # この関数だけ。他の Lambda は呼べない
+```
+
+DynamoDB への書き込み権限は worker のロール（[template.yaml:81-103](../infra/template.yaml#L81)）にある。
+
+```yaml
 - Effect: Allow
   Action: dynamodb:PutItem            # 書き込みのみ。読み取りも削除もできない
   Resource: !GetAtt ResultsTable.Arn  # このテーブルだけ
 ```
 
-1箇所だけ `Resource: '*'` がある（[template.yaml:169-184](../infra/template.yaml#L169)）。
+**書き込みを実際に行う主体に権限を置く**、という当たり前の形。
+SDK 統合を使っていた頃はステートマシン側に付いていた。
+
+1箇所だけ `Resource: '*'` がある（[template.yaml:222-237](../infra/template.yaml#L222)）。
 これは Step Functions のログ配信設定に必要なもので、**AWS の仕様上リソースを絞れない**ため。
 テンプレート内にコメントで明記してある。
 
@@ -381,13 +440,17 @@ bash + jq では非常に書きづらいため。
 `state_times()`（[report.py:35-48](../scripts/report.py#L35)）が `TaskStateEntered` / `TaskStateExited` といったイベントを拾って
 「ステート名 → 開始/終了時刻」の表を作り、これで AC-2（順序）、AC-3（同時開始）、AC-6（先行）を判定している。
 
-**AC-6 の判定**（[report.py:163-168](../scripts/report.py#L163)）が検証全体の要。
+**AC-6 の判定**（[report.py:166-173](../scripts/report.py#L166)）が検証全体の要。
 
 ```python
-put_a = times["PutResultA"]["exit"]   # 加工Aの書き込みが終わった時刻
+a_exit = times["TransformA"]["exit"]  # 加工A（書き込み込み）が終わった時刻
 fan_exit = times["FanOut"]["exit"]    # Parallel 全体が終わった時刻
-ok = put_a < fan_exit                 # 前者が先なら、設計が効いている
+ok = a_exit < fan_exit                # 前者が先なら、設計が効いている
 ```
+
+書き込みが Lambda の中に入ったので、**ステート `TransformA` の退出時刻が「行が確実に読める最初の時刻」**になる。
+より正確な書き込み時刻は行の `writtenAt` に入っていて、report.py は
+「DynamoDB 書き込み結果」の欄にその差も併記する。
 
 実測で平均7.1秒の差がついた。
 
@@ -396,5 +459,5 @@ ok = put_a < fan_exit                 # 前者が先なら、設計が効いて�
 ## 最初に読むならこの順番
 
 1. [要件定義書](./requirements.md) の「6. 設計方針と根拠」 — なぜこの形なのか
-2. [template.yaml:205-401](../infra/template.yaml#L205) の `Definition:` ブロック — ワークフロー定義そのもの
+2. [template.yaml:256-373](../infra/template.yaml#L256) の `Definition:` ブロック — ワークフロー定義そのもの
 3. [検証結果](./results.md) — 実測値

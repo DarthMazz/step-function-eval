@@ -1,0 +1,4 @@
+Console captures for docs/console-comparison.md go here.
+Crop out the browser header and the account/user display before committing:
+this repository is public and those areas contain the AWS account ID and the
+console user name.

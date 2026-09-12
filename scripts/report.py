@@ -107,8 +107,7 @@ def main() -> int:
     base = enqueued if enqueued is not None else started
     print(f"  {'state'.ljust(14)} {'enter'.rjust(8)} {'exit'.rjust(8)} {'dur'.rjust(8)}")
     for name in ("Preprocess", "FanOut",
-                 "TransformA", "PutResultA", "TransformB", "PutResultB",
-                 "TransformC", "PutResultC", "TransformD", "PutResultD",
+                 "TransformA", "TransformB", "TransformC", "TransformD",
                  "MarkComplete"):
         t = times.get(name)
         if not t:
@@ -120,6 +119,8 @@ def main() -> int:
 
     print("\n== DynamoDB 書き込み結果 ==")
     print(f"  {'taskName'.ljust(14)} {'elapsedMs'.rjust(10)}  判定")
+    fast = items.get(FAST_TASK)
+    fan_exit = times.get("FanOut", {}).get("exit")
     for name in (FAST_TASK, *SLOW_TASKS, "zz-complete"):
         row = items.get(name)
         if not row:
@@ -132,6 +133,9 @@ def main() -> int:
             colour = GREEN if elapsed < sla else RED
             verdict = f"{colour}{'OK' if elapsed < sla else 'NG'} (目標 {sla}ms){RESET}"
         print(f"  {name.ljust(14)} {str(elapsed).rjust(10)}  {verdict}")
+    if fast and fan_exit:
+        print(f"  {DIM}transform-a の writtenAt は Parallel 完了の "
+              f"{fan_exit - fast['writtenAt']}ms 前{RESET}")
 
     checks = Checks()
 
@@ -150,7 +154,6 @@ def main() -> int:
                else f"4分岐そろわず ({len(starts)}/4)")
 
     # AC-4 / AC-5: SLA on the DynamoDB write, measured from SQS arrival.
-    fast = items.get(FAST_TASK)
     checks.add(f"AC-4 {FAST_TASK} が {FAST_SLA_MS}ms 以内",
                bool(fast) and fast["elapsedMs"] < FAST_SLA_MS,
                f"{fast['elapsedMs']}ms" if fast else "レコードなし")
@@ -161,11 +164,13 @@ def main() -> int:
                f"最も遅い分岐 {worst}ms ({len(slow_rows)}/3 件)" if worst is not None else "レコードなし")
 
     # AC-6: the whole point -- the fast branch lands before Parallel completes.
-    put_a, fan_exit = times.get("PutResultA", {}).get("exit"), fan.get("exit")
-    ok = bool(put_a and fan_exit and put_a < fan_exit)
+    # The write now happens inside the transform-a Lambda, so TransformA's exit
+    # is the first moment the row is guaranteed to be readable.
+    a_exit = times.get("TransformA", {}).get("exit")
+    ok = bool(a_exit and fan_exit and a_exit < fan_exit)
     checks.add("AC-6 加工A が Parallel 完了より前に書き込み", ok,
-               f"PutResultA={put_a - base}ms < FanOut exit={fan_exit - base}ms "
-               f"(先行 {fan_exit - put_a}ms)" if ok and put_a and fan_exit else "順序を確認できず")
+               f"TransformA exit={a_exit - base}ms < FanOut exit={fan_exit - base}ms "
+               f"(先行 {fan_exit - a_exit}ms)" if ok and a_exit and fan_exit else "順序を確認できず")
 
     # AC-7: clean finish, five rows.
     checks.add("AC-7 SUCCEEDED かつ 5レコード",

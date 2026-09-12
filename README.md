@@ -8,6 +8,7 @@ SQS を起点とした非同期パイプラインで、**並列処理のうち�
 - [要件定義書](docs/requirements.md)
 - [タスク分解](docs/tasks.md)
 - [検証結果](docs/results.md)
+- [STANDARD と EXPRESS のコンソール比較](docs/console-comparison.md) — 障害解析のしやすさを実機で比較
 
 ## 検証するフロー
 
@@ -31,8 +32,10 @@ SQS → ① 受付Lambda → StartExecution
 各処理の中身はスタブ（指定秒数スリープするだけ）。計測起点は **SQS へのメッセージ到着時刻**。
 
 **設計の要点**: Parallel は全ブランチの完了を待つため、ステートマシンの出力経路に結果を載せると
-加工A も最も遅い分岐に引きずられる。そこで**各分岐の末尾で自分の結果を DynamoDB に書き込む**
-（Step Functions の AWS SDK 統合を使用）。これで加工A は他分岐を待たずに読み出せる。
+加工A も最も遅い分岐に引きずられる。そこで**各分岐の加工 Lambda が、返る前に自分の結果を DynamoDB に書き込む**。
+これで加工A は他分岐を待たずに読み出せる。
+
+ステートマシン定義は**フローの順序だけ**を持ち、結果の出力仕様（テーブル・属性・TTL）は worker Lambda 側にある。
 
 ## 前提
 
@@ -60,7 +63,7 @@ TRANSFORM_A_SLEEP=1 TRANSFORM_BCD_SLEEP=12 scripts/deploy.sh
 
 | パス | 内容 |
 |---|---|
-| `infra/template.yaml` | 全リソースの CloudFormation テンプレート（Lambda コードもインライン） |
+| `infra/template.yaml` | 全リソースの CloudFormation テンプレート（Lambda コードもインライン）。ステートマシン定義はフローのみ |
 | `scripts/common.sh` | スタック出力の取得など共通処理 |
 | `scripts/report.py` | 実行履歴と DynamoDB から受け入れ基準を判定（標準ライブラリのみ） |
 | `docs/` | 解説・要件定義・タスク分解・検証結果 |
