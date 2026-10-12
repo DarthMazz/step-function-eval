@@ -9,6 +9,7 @@ SQS を起点とした非同期パイプラインで、**並列処理のうち�
 - [タスク分解](docs/tasks.md)
 - [検証結果](docs/results.md)
 - [STANDARD と EXPRESS のコンソール比較](docs/console-comparison.md) — 障害解析のしやすさを実機で比較
+- [Lambda を呼び出せなかったときの Retry](docs/invoke-failure-retry.md) — 呼び出し失敗のエラー名と Retry の設定
 
 ## 検証するフロー
 

@@ -282,6 +282,22 @@ Resources:
                 stage: preprocess
                 sleepSeconds: '${PreprocessSleep}'
                 input: '{% $states.input.body %}'
+            # Re-invoke only on transient failures of the invoke call itself.
+            # Permission errors (Lambda.AWSLambdaException) and missing functions
+            # (Lambda.ResourceNotFoundException) never heal, so they fail at once.
+            # Waits are fixed at 1s: with backoff the 15s SLA of transform-b/c/d
+            # no longer holds when preprocess and the branch both exhaust retries.
+            # No jitter: measured FULL jitter on a 1s interval waited either ~0s
+            # or ~1s, so both retries often fired within 0.3s -- too soon for a
+            # throttle to clear.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.TooManyRequestsException
+                  - Lambda.ServiceException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 1
+                MaxAttempts: 2
+                BackoffRate: 1
             # No "emit" -- the preprocess stage writes nothing.
             # Carry the SLA clock into every branch as a variable.
             Assign:
@@ -312,6 +328,15 @@ Resources:
                         emit:
                           executionId: '{% $states.context.Execution.Name %}'
                           enqueuedAt: '{% $enqueuedAt %}'
+                    # Same retry policy as Preprocess.
+                    Retry:
+                      - ErrorEquals:
+                          - Lambda.TooManyRequestsException
+                          - Lambda.ServiceException
+                          - Lambda.SdkClientException
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
                     Output: '{% { "taskName": "transform-a", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
@@ -329,6 +354,15 @@ Resources:
                         emit:
                           executionId: '{% $states.context.Execution.Name %}'
                           enqueuedAt: '{% $enqueuedAt %}'
+                    # Same retry policy as Preprocess.
+                    Retry:
+                      - ErrorEquals:
+                          - Lambda.TooManyRequestsException
+                          - Lambda.ServiceException
+                          - Lambda.SdkClientException
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
                     Output: '{% { "taskName": "transform-b", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
@@ -346,6 +380,15 @@ Resources:
                         emit:
                           executionId: '{% $states.context.Execution.Name %}'
                           enqueuedAt: '{% $enqueuedAt %}'
+                    # Same retry policy as Preprocess.
+                    Retry:
+                      - ErrorEquals:
+                          - Lambda.TooManyRequestsException
+                          - Lambda.ServiceException
+                          - Lambda.SdkClientException
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
                     Output: '{% { "taskName": "transform-c", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
@@ -363,6 +406,15 @@ Resources:
                         emit:
                           executionId: '{% $states.context.Execution.Name %}'
                           enqueuedAt: '{% $enqueuedAt %}'
+                    # Same retry policy as Preprocess.
+                    Retry:
+                      - ErrorEquals:
+                          - Lambda.TooManyRequestsException
+                          - Lambda.ServiceException
+                          - Lambda.SdkClientException
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
                     Output: '{% { "taskName": "transform-d", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
                     End: true
 
@@ -378,6 +430,15 @@ Resources:
                   executionId: '{% $states.context.Execution.Name %}'
                   enqueuedAt: '{% $enqueuedAt %}'
                   messageId: '{% $messageId %}'
+            # Same retry policy as Preprocess.
+            Retry:
+              - ErrorEquals:
+                  - Lambda.TooManyRequestsException
+                  - Lambda.ServiceException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 1
+                MaxAttempts: 2
+                BackoffRate: 1
             Output: '{% { "messageId": $messageId, "branches": $states.input } %}'
             End: true
 

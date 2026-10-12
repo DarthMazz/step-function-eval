@@ -160,13 +160,15 @@ boto3 の初期化コストがコールド時に乗る。**どちらを重視す
 
 - [STANDARD と EXPRESS のコンソール比較](./console-comparison.md) — 同一テンプレートを `Prefix` 違いで
   2スタック立て、同一原因の失敗実行を両方に作って画面を比較した記録
+- [Lambda を呼び出せなかったときの Retry](./invoke-failure-retry.md) — 呼び出し失敗のエラー名と、
+  SLA に収まる Retry の設定を実機で決めた記録
 
 ## 今後の検証候補
 
 - **分岐単位の `Catch`**: Parallel は1分岐が失敗すると他の実行中分岐をキャンセルするため、
   加工A の失敗が B/C/D を巻き添えにする。分岐ごとに握り潰す設計の確認
 - **コールドスタートの緩和**: boto3 クライアントの遅延初期化 / SnapStart / Provisioned Concurrency
-- Retry / タイムアウト / Redrive の挙動
+- Task のタイムアウト / Redrive の挙動（呼び出し失敗の Retry は [確認済み](./invoke-failure-retry.md)）
 - `Map` + `MaxConcurrency` による同時実行数制御
 - Express ワークフローとの実行時間・コスト比較
 - 高負荷時（同時多数メッセージ）の Lambda 同時実行数と SLA への影響
