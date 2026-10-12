@@ -162,11 +162,13 @@ boto3 の初期化コストがコールド時に乗る。**どちらを重視す
   2スタック立て、同一原因の失敗実行を両方に作って画面を比較した記録
 - [Lambda を呼び出せなかったときの Retry](./invoke-failure-retry.md) — 呼び出し失敗のエラー名と、
   SLA に収まる Retry の設定を実機で決めた記録
+- [タスク失敗時のステータス更新](./task-failure-notify.md) — `Catch` から DLQ 経由で、失敗した場所に応じた行を
+  `ERROR` にする構成の記録
 
 ## 今後の検証候補
 
-- **分岐単位の `Catch`**: Parallel は1分岐が失敗すると他の実行中分岐をキャンセルするため、
-  加工A の失敗が B/C/D を巻き添えにする。分岐ごとに握り潰す設計の確認
+- ~~**分岐単位の `Catch`**~~: [task-failure-notify.md](./task-failure-notify.md) で対応済み。
+  残りは `Catch` で終わった実行の Redrive の挙動
 - **コールドスタートの緩和**: boto3 クライアントの遅延初期化 / SnapStart / Provisioned Concurrency
 - Task のタイムアウト / Redrive の挙動（呼び出し失敗の Retry は [確認済み](./invoke-failure-retry.md)）
 - `Map` + `MaxConcurrency` による同時実行数制御

@@ -62,6 +62,9 @@ Resources:
   # ------------------------------------------------------------------
   # Intake queue
   # ------------------------------------------------------------------
+  # Two producers: SQS moves intake messages here after maxReceiveCount, and
+  # the state machine sends a failure notice here when a task fails. The
+  # status Lambda (below) consumes both and marks result rows as ERROR.
   IntakeDlq:
     Type: AWS::SQS::Queue
     Properties:
@@ -186,6 +189,7 @@ Resources:
               item = {
                   "executionId": {"S": emit["executionId"]},
                   "taskName": {"S": stage},
+                  "status": {"S": "SUCCEEDED"},
                   "enqueuedAt": {"N": str(enqueued_at)},
                   "writtenAt": {"N": str(written_at)},
                   "elapsedMs": {"N": str(written_at - enqueued_at)},
@@ -228,6 +232,15 @@ Resources:
                 Resource:
                   - !GetAtt WorkerFunction.Arn
                   - !Sub '${WorkerFunction.Arn}:*'
+        # Failure notices go to the intake DLQ. The state machine only says
+        # where it failed; which rows become ERROR is the status Lambda's call.
+        - PolicyName: notify-failure
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt IntakeDlq.Arn
         - PolicyName: vended-logs
           PolicyDocument:
             Version: '2012-10-17'
@@ -262,13 +275,16 @@ Resources:
         PreprocessSleep: !Ref PreprocessSleepSeconds
         TransformASleep: !Ref TransformASleepSeconds
         TransformBcdSleep: !Ref TransformBcdSleepSeconds
+        DlqUrl: !Ref IntakeDlq
       Definition:
         QueryLanguage: JSONata
         Comment: >-
           Preprocess, then fan out to four independent transforms. This
           definition describes the flow only: each stage's worker writes its own
           result row to DynamoDB before it returns, so transform-a is readable
-          long before the slow branches finish.
+          long before the slow branches finish. When a task fails, a notice
+          naming the failed stage goes to the intake DLQ; a failed transform
+          does not stop the other branches.
         TimeoutSeconds: 300
         StartAt: Preprocess
         States:
@@ -298,6 +314,14 @@ Resources:
                 IntervalSeconds: 1
                 MaxAttempts: 2
                 BackoffRate: 1
+            # Anything left after Retry -- invoke failures and errors raised
+            # inside the worker alike -- is reported and fails the execution.
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Assign:
+                  failedStage: preprocess
+                  failure: '{% $states.errorOutput %}'
+                Next: NotifyFailure
             # No "emit" -- the preprocess stage writes nothing.
             # Carry the SLA clock into every branch as a variable.
             Assign:
@@ -337,7 +361,27 @@ Resources:
                         IntervalSeconds: 1
                         MaxAttempts: 2
                         BackoffRate: 1
+                    # A failed transform is reported and its branch ends
+                    # normally, so the other branches keep running and write
+                    # their own rows. CheckBranches fails the execution later.
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        Output: '{% $states.errorOutput %}'
+                        Next: NotifyA
                     Output: '{% { "taskName": "transform-a", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
+                    End: true
+                  NotifyA:
+                    Type: Task
+                    Resource: arn:aws:states:::sqs:sendMessage
+                    Arguments:
+                      QueueUrl: '${DlqUrl}'
+                      MessageBody: '{% $string({ "messageId": $messageId, "executionId": $states.context.Execution.Name, "enqueuedAt": $enqueuedAt, "failedStage": "transform-a", "error": $states.input.Error, "cause": $states.input.Cause }) %}'
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
+                    Output: '{% { "taskName": "transform-a", "error": $states.input.Error } %}'
                     End: true
 
               - StartAt: TransformB
@@ -363,7 +407,25 @@ Resources:
                         IntervalSeconds: 1
                         MaxAttempts: 2
                         BackoffRate: 1
+                    # Same as TransformA: report, then end the branch normally.
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        Output: '{% $states.errorOutput %}'
+                        Next: NotifyB
                     Output: '{% { "taskName": "transform-b", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
+                    End: true
+                  NotifyB:
+                    Type: Task
+                    Resource: arn:aws:states:::sqs:sendMessage
+                    Arguments:
+                      QueueUrl: '${DlqUrl}'
+                      MessageBody: '{% $string({ "messageId": $messageId, "executionId": $states.context.Execution.Name, "enqueuedAt": $enqueuedAt, "failedStage": "transform-b", "error": $states.input.Error, "cause": $states.input.Cause }) %}'
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
+                    Output: '{% { "taskName": "transform-b", "error": $states.input.Error } %}'
                     End: true
 
               - StartAt: TransformC
@@ -389,7 +451,25 @@ Resources:
                         IntervalSeconds: 1
                         MaxAttempts: 2
                         BackoffRate: 1
+                    # Same as TransformA: report, then end the branch normally.
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        Output: '{% $states.errorOutput %}'
+                        Next: NotifyC
                     Output: '{% { "taskName": "transform-c", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
+                    End: true
+                  NotifyC:
+                    Type: Task
+                    Resource: arn:aws:states:::sqs:sendMessage
+                    Arguments:
+                      QueueUrl: '${DlqUrl}'
+                      MessageBody: '{% $string({ "messageId": $messageId, "executionId": $states.context.Execution.Name, "enqueuedAt": $enqueuedAt, "failedStage": "transform-c", "error": $states.input.Error, "cause": $states.input.Cause }) %}'
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
+                    Output: '{% { "taskName": "transform-c", "error": $states.input.Error } %}'
                     End: true
 
               - StartAt: TransformD
@@ -415,7 +495,25 @@ Resources:
                         IntervalSeconds: 1
                         MaxAttempts: 2
                         BackoffRate: 1
+                    # Same as TransformA: report, then end the branch normally.
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        Output: '{% $states.errorOutput %}'
+                        Next: NotifyD
                     Output: '{% { "taskName": "transform-d", "elapsedMs": $states.result.Payload.writtenAt - $enqueuedAt } %}'
+                    End: true
+                  NotifyD:
+                    Type: Task
+                    Resource: arn:aws:states:::sqs:sendMessage
+                    Arguments:
+                      QueueUrl: '${DlqUrl}'
+                      MessageBody: '{% $string({ "messageId": $messageId, "executionId": $states.context.Execution.Name, "enqueuedAt": $enqueuedAt, "failedStage": "transform-d", "error": $states.input.Error, "cause": $states.input.Cause }) %}'
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 1
+                        MaxAttempts: 2
+                        BackoffRate: 1
+                    Output: '{% { "taskName": "transform-d", "error": $states.input.Error } %}'
                     End: true
 
           MarkComplete:
@@ -439,8 +537,52 @@ Resources:
                 IntervalSeconds: 1
                 MaxAttempts: 2
                 BackoffRate: 1
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Assign:
+                  failedStage: zz-complete
+                  failure: '{% $states.errorOutput %}'
+                Next: NotifyFailure
             Output: '{% { "messageId": $messageId, "branches": $states.input } %}'
-            End: true
+            Next: CheckBranches
+
+          # Every branch has finished (and zz-complete is written) by now. If
+          # any transform failed, end FAILED so it shows in the execution list.
+          CheckBranches:
+            Type: Choice
+            Choices:
+              - Condition: '{% $count($states.input.branches[$exists(error)]) > 0 %}'
+                Next: BranchesFailed
+            Default: Done
+
+          BranchesFailed:
+            Type: Fail
+            Error: sfeval.BranchFailed
+            Cause: '{% "failed: " & $join($states.input.branches[$exists(error)].taskName, ", ") %}'
+
+          Done:
+            Type: Succeed
+
+          # Shared by Preprocess and MarkComplete; the Catch that led here set
+          # $failedStage and $failure. Reads identity from the execution input
+          # because Preprocess's own Assign never ran if it failed.
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage
+            Arguments:
+              QueueUrl: '${DlqUrl}'
+              MessageBody: '{% $string({ "messageId": $states.context.Execution.Input.messageId, "executionId": $states.context.Execution.Name, "enqueuedAt": $states.context.Execution.Input.enqueuedAt, "failedStage": $failedStage, "error": $failure.Error, "cause": $failure.Cause }) %}'
+            Retry:
+              - ErrorEquals: [States.ALL]
+                IntervalSeconds: 1
+                MaxAttempts: 2
+                BackoffRate: 1
+            Next: Failed
+
+          Failed:
+            Type: Fail
+            Error: '{% $failure.Error %}'
+            Cause: '{% $failure.Cause %}'
 
   # ------------------------------------------------------------------
   # Intake: SQS -> Lambda -> StartExecution
@@ -571,6 +713,168 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
+  # ------------------------------------------------------------------
+  # Status: DLQ -> Lambda -> mark result rows as ERROR
+  # Stand-in for the real system's DLQ Lambda.
+  # ------------------------------------------------------------------
+  DlqLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Prefix}-dlq'
+      RetentionInDays: 7
+
+  DlqRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Prefix}-dlq-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consume-dlq
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IntakeDlq.Arn
+        - PolicyName: mark-results
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt ResultsTable.Arn
+
+  DlqFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DlqLogGroup
+    Properties:
+      FunctionName: !Sub '${Prefix}-dlq'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DlqRole.Arn
+      # Must stay below the DLQ's visibility timeout (30s default).
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ResultsTable
+          RESULT_TTL_SECONDS: !Ref ResultTtlSeconds
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import time
+
+          import boto3
+
+          RESULTS_TABLE = os.environ["RESULTS_TABLE"]
+          TTL_SECONDS = int(os.environ["RESULT_TTL_SECONDS"])
+
+          # Every row a run is expected to produce. A failure before the
+          # transforms start leaves all of them unwritten, so all become ERROR.
+          ALL_STAGES = ("transform-a", "transform-b", "transform-c",
+                        "transform-d", "zz-complete")
+          WHOLE_RUN = ("intake", "preprocess")
+
+          dynamodb = boto3.client("dynamodb")
+
+
+          def handler(event, context):
+              failures = []
+              for record in event.get("Records", []):
+                  try:
+                      notice = parse(record)
+                      stages = (ALL_STAGES if notice["failedStage"] in WHOLE_RUN
+                                else (notice["failedStage"],))
+                      for stage in stages:
+                          mark_error(notice, stage)
+                      print(json.dumps({"msg": "status.error", **notice,
+                                        "marked": list(stages)}))
+                  except Exception as exc:  # noqa: BLE001 - report back to SQS
+                      print(json.dumps({"msg": "status.failed",
+                                        "messageId": record["messageId"],
+                                        "error": repr(exc)}))
+                      failures.append({"itemIdentifier": record["messageId"]})
+              return {"batchItemFailures": failures}
+
+
+          def parse(record):
+              """Read a failure notice, keyed by values in the message body.
+
+              The state machine sends a notice naming the failed stage. Anything
+              else is an intake message SQS moved here after maxReceiveCount:
+              StartExecution never succeeded, and SQS keeps the original
+              messageId on the move.
+              """
+              try:
+                  body = json.loads(record["body"])
+              except ValueError:
+                  body = None
+              if isinstance(body, dict) and "failedStage" in body:
+                  return {k: body.get(k) for k in ("messageId", "executionId",
+                          "enqueuedAt", "failedStage", "error", "cause")}
+
+              message_id = record["messageId"]
+              return {
+                  "messageId": message_id,
+                  # Same naming rule as the intake Lambda.
+                  "executionId": re.sub(r"[^0-9a-zA-Z_-]", "-", message_id)[:80],
+                  "enqueuedAt": int(record["attributes"]["SentTimestamp"]),
+                  "failedStage": "intake",
+                  "error": "IntakeFailed",
+                  "cause": "StartExecution did not succeed within maxReceiveCount",
+              }
+
+
+          def mark_error(notice, stage):
+              now = int(time.time() * 1000)
+              dynamodb.update_item(
+                  TableName=RESULTS_TABLE,
+                  Key={"executionId": {"S": notice["executionId"]},
+                       "taskName": {"S": stage}},
+                  UpdateExpression=(
+                      "SET #status = :status, #error = :error, #cause = :cause,"
+                      " #failedStage = :failedStage, #messageId = :messageId,"
+                      " #enqueuedAt = :enqueuedAt, #updatedAt = :now,"
+                      " #expireAt = :expireAt"),
+                  ExpressionAttributeNames={
+                      f"#{k}": k for k in ("status", "error", "cause",
+                      "failedStage", "messageId", "enqueuedAt", "updatedAt",
+                      "expireAt")},
+                  ExpressionAttributeValues={
+                      ":status": {"S": "ERROR"},
+                      ":error": {"S": str(notice["error"])},
+                      ":cause": {"S": str(notice["cause"])},
+                      ":failedStage": {"S": notice["failedStage"]},
+                      ":messageId": {"S": str(notice["messageId"])},
+                      ":enqueuedAt": {"N": str(int(notice["enqueuedAt"]))},
+                      ":now": {"N": str(now)},
+                      ":expireAt": {"N": str(now // 1000 + TTL_SECONDS)},
+                  },
+              )
+
+  DlqEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IntakeDlq.Arn
+      FunctionName: !GetAtt DlqFunction.Arn
+      BatchSize: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
 Outputs:
   QueueUrl:
     Description: Send test messages here.
@@ -589,3 +893,5 @@ Outputs:
     Value: !Ref IntakeFunction
   WorkerFunctionName:
     Value: !Ref WorkerFunction
+  DlqFunctionName:
+    Value: !Ref DlqFunction

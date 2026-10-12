@@ -138,9 +138,22 @@ Step Functions から Lambda を**呼び出せなかった**とき（関数の�
   3. ✅ スロットリングから回復すること、直らない失敗は呼び直さないことを確認
   4. ✅ 結果を `docs/invoke-failure-retry.md` に記録
 
+### T4-4. タスク失敗時のステータス更新（2026-10-12）
+
+Task が失敗したら、DynamoDB の該当する行を `ERROR` にする。実システムの DLQ Lambda を再利用する想定。
+
+- 各 Task の `Catch` から、失敗した場所（`failedStage`）を本文に入れて DLQ に送る
+- DLQ Lambda（代役 `sfeval-dlq`）が `failedStage` で対象の行を選ぶ。Preprocess なら全行、加工ならその行だけ
+- 加工の失敗では分岐を止めず、ほかの分岐を完走させる。全分岐の終了後に実行を `FAILED` にする
+- 完了条件: **すべて達成**
+  1. ✅ Preprocess / 加工B / MarkComplete の失敗で、表どおりの行だけが `ERROR` になる
+  2. ✅ 加工B が失敗しても A/C/D は完走して `SUCCEEDED` を書く
+  3. ✅ どのケースも実行は `FAILED` で終わる
+  4. ✅ 結果を `docs/task-failure-notify.md` に記録
+
 ### 今後の候補
 
-- 分岐単位の `Catch` による失敗の封じ込め（Parallel の巻き添えキャンセル対策）
+- `Catch` で終わった実行の Redrive の挙動（分岐単位の `Catch` は T4-4 で済み）
 - Task のタイムアウト / Redrive の挙動確認（呼び出し失敗の Retry は T4-3 で済み）
 - `Map` + `MaxConcurrency` による同時実行数制御
 - Express との比較
