@@ -125,9 +125,22 @@
   2. ✅ 一覧・失敗詳細・グラフビューを比較
   3. ✅ 結果を `docs/console-comparison.md` に記録
 
+### T4-3. Lambda 呼び出し失敗への Retry（2026-10-12）
+
+Step Functions から Lambda を**呼び出せなかった**とき（関数のコードが動かないとき）の扱いを決める。
+
+- Retry なしの定義で、スロットリング / 権限なし / 関数なしの3種を起こし、届くエラー名を確認する
+- 一時的な失敗だけを対象にした `Retry` を、Lambda を呼ぶ6つの Task すべてに置く
+- 呼び直しの間隔と回数は SLA（加工A 10秒 / 加工B・C・D 15秒）に収める
+- 完了条件: **すべて達成**
+  1. ✅ 3種のエラー名を確認（権限なしは `Lambda.AWSLambdaException` で届く）
+  2. ✅ `TooManyRequests` / `Service` / `SdkClient` の3つだけを、1秒固定・最大2回で呼び直す
+  3. ✅ スロットリングから回復すること、直らない失敗は呼び直さないことを確認
+  4. ✅ 結果を `docs/invoke-failure-retry.md` に記録
+
 ### 今後の候補
 
 - 分岐単位の `Catch` による失敗の封じ込め（Parallel の巻き添えキャンセル対策）
-- Retry / タイムアウト / Redrive の挙動確認
+- Task のタイムアウト / Redrive の挙動確認（呼び出し失敗の Retry は T4-3 で済み）
 - `Map` + `MaxConcurrency` による同時実行数制御
 - Express との比較
