@@ -179,6 +179,6 @@ aws stepfunctions update-state-machine --state-machine-arn <ARN> --definition fi
 - **応答だけが失われたときの二重実行**: `ServiceException` が Lambda の実行後に返ると、リトライで同じ処理が
   2回走りうる。worker の書き込みは同一キーへの `PutItem` なので上書きになるだけのはずだが、
   この状況は意図して再現できず、**未検証**
-- **`Catch` による失敗の封じ込め**: リトライで直らなかった失敗は、今も実行全体を `FAILED` にする
+- **`Catch` による失敗の封じ込め**: リトライで直らなかった失敗の扱いは [task-failure-notify.md](./task-failure-notify.md) で対応した
 - **高負荷時のスロットリング**: 多数の実行が同時に失敗したとき、ジッターなしだと全員が1秒後に揃って呼び直す。
   同時実行数の検証と合わせて確認する

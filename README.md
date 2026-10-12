@@ -10,6 +10,7 @@ SQS を起点とした非同期パイプラインで、**並列処理のうち�
 - [検証結果](docs/results.md)
 - [STANDARD と EXPRESS のコンソール比較](docs/console-comparison.md) — 障害解析のしやすさを実機で比較
 - [Lambda を呼び出せなかったときの Retry](docs/invoke-failure-retry.md) — 呼び出し失敗のエラー名と Retry の設定
+- [タスク失敗時のステータス更新](docs/task-failure-notify.md) — 失敗した場所に応じて DynamoDB の行を `ERROR` にする
 
 ## 検証するフロー
 
@@ -73,5 +74,5 @@ TRANSFORM_A_SLEEP=1 TRANSFORM_BCD_SLEEP=12 scripts/deploy.sh
 
 すべて `sfeval-` プレフィクス、CloudFormation スタック `sfeval-poc` に含まれる。
 
-`sfeval-intake`（SQS + DLQ）/ `sfeval-intake`（Lambda）/ `sfeval-worker`（Lambda）/
+`sfeval-intake`（SQS + DLQ）/ `sfeval-intake`（Lambda）/ `sfeval-worker`（Lambda）/ `sfeval-dlq`（Lambda）/
 `sfeval-workflow`（ステートマシン）/ `sfeval-results`（DynamoDB）/ 各 IAM ロール・ロググループ
